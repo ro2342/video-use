@@ -23,7 +23,7 @@ Drop raw footage in a folder, chat with Claude Code, get `final.mp4` back. Works
 Paste into Claude Code, Codex, Hermes, Openclaw, or any agent with shell access:
 
 ```text
-Set up https://github.com/browser-use/video-use for me.
+Set up https://github.com/ro2342/video-use for me.
 
 Read install.md first to install this repo, wire up ffmpeg, register the skill with whichever agent you're running under, and set up the ElevenLabs API key — ask me to paste it when you need it. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
 ```
@@ -34,7 +34,7 @@ Then point your agent at a folder of raw takes:
 
 ```bash
 cd /path/to/your/videos
-claude    # or codex, hermes, etc.
+openclaude    # or codex, hermes, etc.
 ```
 
 For always-on editing from your own VPS or Telegram, run the agent through [Browser Use Box](https://browser-use.com/bux). [Watch the 15-second demo](https://www.tiktok.com/@browser_use/video/7639824093721758989).
@@ -51,8 +51,8 @@ If you'd rather do it by hand:
 
 ```bash
 # 1. Clone and symlink into your agent's skills directory
-git clone https://github.com/browser-use/video-use ~/Developer/video-use
-ln -sfn ~/Developer/video-use ~/.claude/skills/video-use        # Claude Code
+git clone https://github.com/ro2342/video-use ~/Developer/video-use
+ln -sfn ~/Developer/video-use ~/.openclaude/skills/video-use        # Claude Code
 # ln -sfn ~/Developer/video-use ~/.codex/skills/video-use       # Codex
 
 # 2. Install deps
