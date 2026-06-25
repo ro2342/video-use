@@ -33,7 +33,7 @@ And one thing must be true about the current agent:
 ### 1. Clone to a stable path
 
 ```bash
-test -d ~/Developer/video-use || git clone https://github.com/browser-use/video-use ~/Developer/video-use
+test -d ~/Developer/video-use || git clone https://github.com/ro2342/video-use/ ~/Developer/video-use
 cd ~/Developer/video-use
 ```
 
@@ -71,11 +71,11 @@ If `brew` / `apt` / `pacman` requires a sudo prompt, tell the user the exact com
 
 Figure out which agent you are running under, and register once. A symlink of the whole repo directory is the right shape — helpers/ needs to sit next to SKILL.md.
 
-- **Claude Code** (`~/.claude/` present):
+- **Claude Code or OpenClaude** (`~/.openclaude/` present):
 
     ```bash
-    mkdir -p ~/.claude/skills
-    ln -sfn ~/Developer/video-use ~/.claude/skills/video-use
+    mkdir -p ~/.openclaude/skills
+    ln -sfn ~/Developer/video-use ~/.openclaude/skills/video-use
     ```
 
 - **Codex** (`$CODEX_HOME` set, or `~/.codex/` present):
