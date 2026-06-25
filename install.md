@@ -19,7 +19,7 @@ Three things must exist on this machine:
 
 And one thing must be true about the current agent:
 
-4. It can discover `SKILL.md` — either via a global skills directory (`~/.claude/skills/`, `~/.codex/skills/`) or via a `CLAUDE.md` / system-prompt import.
+4. It can discover `SKILL.md` — either via a global skills directory (`~/.openclaude/skills/`, `~/.codex/skills/`) or via a `CLAUDE.md` / system-prompt import.
 
 ## Install prompt contract
 
