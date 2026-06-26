@@ -264,17 +264,60 @@ def convert_all_sources(sources: dict, out_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def ffprobe_fps(path) -> Fraction:
+    return ffprobe_info(path)["fps"]
+
+
+def ffprobe_info(path) -> dict:
+    """Retorna fps, width, height, duration, start_time e audio_channels do arquivo."""
     try:
         out = subprocess.check_output(
-            ["ffprobe", "-v", "0", "-select_streams", "v:0",
-             "-show_entries", "stream=r_frame_rate",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            [
+                "ffprobe", "-v", "0",
+                "-show_entries",
+                "stream=r_frame_rate,width,height,channels,codec_type"
+                ":format=duration,start_time",
+                "-of", "json", str(path),
+            ],
             stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        num, den = out.split("/")
-        return Fraction(int(num), int(den))
+        ).decode()
+        data = json.loads(out)
     except Exception:
-        return Fraction(30, 1)
+        return {
+            "fps": Fraction(30, 1), "width": 1920, "height": 1080,
+            "duration": 0.0, "start_time": 0.0, "audio_channels": 2,
+        }
+
+    fps = Fraction(30, 1)
+    width, height = 1920, 1080
+    audio_channels = 2
+
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "video" and "r_frame_rate" in s:
+            try:
+                num, den = s["r_frame_rate"].split("/")
+                fps = Fraction(int(num), int(den))
+            except Exception:
+                pass
+            width = s.get("width", width)
+            height = s.get("height", height)
+        elif s.get("codec_type") == "audio":
+            audio_channels = s.get("channels", audio_channels)
+
+    fmt = data.get("format", {})
+    try:
+        duration = float(fmt.get("duration", 0.0))
+    except Exception:
+        duration = 0.0
+    try:
+        start_time = float(fmt.get("start_time", 0.0))
+    except Exception:
+        start_time = 0.0
+
+    return {
+        "fps": fps, "width": width, "height": height,
+        "duration": duration, "start_time": start_time,
+        "audio_channels": audio_channels,
+    }
 
 
 def secs_to_rational(seconds: float, fps: Fraction) -> str:
@@ -338,11 +381,17 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
         afps = fps_by_source[name]
         fdur = f"{afps.denominator}/{afps.numerator}s"
         abs_path = os.path.abspath(path)
+        info = ffprobe_info(path)
+        audio_channels = info.get("audio_channels", 2)
+        dur_str = secs_to_rational(info.get("duration", 0.0), afps)
+        start_str_asset = secs_to_rational(info.get("start_time", 0.0), afps)
         resources.append(
-            f'    <asset id="{asset_id}" name="{escape(name)}" '
-            f'src="file://{escape(abs_path)}" hasVideo="1" hasAudio="1" '
-            f'format="r_fmt_{asset_id}" />\n'
             f'    <format id="r_fmt_{asset_id}" frameDuration="{fdur}" />\n'
+            f'    <asset id="{asset_id}" name="{escape(name)}" '
+            f'hasVideo="1" hasAudio="1" audioSources="1" audioChannels="{audio_channels}" '
+            f'format="r_fmt_{asset_id}" duration="{dur_str}" start="{start_str_asset}">\n'
+            f'        <media-rep src="file://{escape(abs_path)}" kind="original-media"/>\n'
+            f'    </asset>\n'
         )
         if next_id == 2:  # primeiro source = formato da sequência
             resources.append(f'    <format id="r_fmt_seq" frameDuration="{fdur}" />\n')
@@ -354,11 +403,15 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
         ov_path = os.path.abspath(str((edit_dir / ov["file"]) if not Path(ov["file"]).is_absolute() else ov["file"]))
         ov_fps = ffprobe_fps(ov_path)
         fdur = f"{ov_fps.denominator}/{ov_fps.numerator}s"
+        ov_info = ffprobe_info(ov_path)
+        ov_dur_str = secs_to_rational(ov_info.get("duration", 0.0), ov_fps)
         resources.append(
-            f'    <asset id="{asset_id}" name="{escape(Path(ov["file"]).name)}" '
-            f'src="file://{escape(ov_path)}" hasVideo="1" hasAudio="0" '
-            f'format="r_fmt_{asset_id}" />\n'
             f'    <format id="r_fmt_{asset_id}" frameDuration="{fdur}" />\n'
+            f'    <asset id="{asset_id}" name="{escape(Path(ov["file"]).name)}" '
+            f'hasVideo="1" hasAudio="0" '
+            f'format="r_fmt_{asset_id}" duration="{ov_dur_str}" start="0/1s">\n'
+            f'        <media-rep src="file://{escape(ov_path)}" kind="original-media"/>\n'
+            f'    </asset>\n'
         )
 
     # ---- clipes principais (cortes), em ordem = decupagem ----
