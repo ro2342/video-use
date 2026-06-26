@@ -198,13 +198,25 @@ def auto_grade_to_cdl(video: Path, start: float, duration: float):
 # Conversão mp4 -> mov com áudio PCM (REQUISITO CRÍTICO no Fedora/Linux)
 # ---------------------------------------------------------------------------
 
-def convert_to_mov(src_path: Path, out_dir: Path) -> Path:
-    """Converte um arquivo de origem para .mov com áudio PCM, requisito do
-    DaVinci Resolve no Linux/Fedora (AAC dentro de .mp4 frequentemente não
-    reproduz áudio corretamente no Resolve nessa plataforma).
+def _video_codec(src_path: Path) -> str:
+    """Retorna o codec de vídeo do arquivo (ex: 'hevc', 'h264') via ffprobe."""
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "0", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "json", str(src_path)],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        streams = json.loads(out).get("streams", [])
+        return streams[0].get("codec_name", "") if streams else ""
+    except Exception:
+        return ""
 
-    Vídeo é copiado sem recodificar (rápido, sem perda). Áudio é convertido
-    para PCM 16-bit 48kHz, que o Resolve sempre lê sem problema.
+
+def convert_to_mov(src_path: Path, out_dir: Path) -> Path:
+    """Converte um arquivo de origem para .mov com vídeo H.264 e áudio PCM.
+
+    DaVinci Resolve Free no Linux não suporta HEVC/H.265 — recodifica sempre
+    para H.264 (libx264 CRF 16, alta qualidade) + PCM 16-bit 48kHz.
 
     Idempotente: se o .mov de saída já existe, não reconverte.
     """
@@ -215,44 +227,34 @@ def convert_to_mov(src_path: Path, out_dir: Path) -> Path:
         print(f"  já convertido, pulando: {out_path.name}")
         return out_path
 
+    # Sempre recodifica para H.264: Resolve Free/Linux não decodifica HEVC,
+    # mesmo dentro de .mov — sem conversão, Resolve só vê a trilha de áudio.
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(src_path),
-        "-c:v", "copy",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
         "-c:a", "pcm_s16le", "-ar", "48000",
         str(out_path),
     ]
-    print(f"  convertendo para .mov (áudio PCM): {src_path.name} -> {out_path.name}")
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError:
-        # Fallback: alguns perfis de vídeo não podem ser copiados direto para
-        # .mov. Recodifica vídeo como H.264 mantendo qualidade alta.
-        print(f"  copy direto falhou, recodificando vídeo (H.264 CRF 16): {src_path.name}")
-        cmd_fallback = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(src_path),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
-            "-c:a", "pcm_s16le", "-ar", "48000",
-            str(out_path),
-        ]
-        subprocess.run(cmd_fallback, check=True)
-
+    print(f"  convertendo para H.264 .mov (Resolve-ready): {src_path.name} -> {out_path.name}")
+    subprocess.run(cmd, check=True)
     return out_path
 
 
 def convert_all_sources(sources: dict, out_dir: Path) -> dict:
-    """Converte todos os sources do EDL para .mov e retorna um novo dict
-    {nome: caminho_mov} para uso no resto do export."""
+    """Converte todos os sources do EDL para .mov H.264+PCM e retorna um novo
+    dict {nome: caminho_mov} para uso no resto do export.
+
+    Converte independente do container original: .mp4, .mov com HEVC e
+    qualquer outro formato são normalizados para H.264+PCM que o Resolve
+    Free/Linux lê corretamente.
+    """
     converted = {}
     for name, path in sources.items():
         src_path = Path(path)
         if not src_path.exists():
             print(f"  aviso: source '{name}' não encontrado em {src_path}, mantendo caminho original")
             converted[name] = path
-            continue
-        if src_path.suffix.lower() == ".mov":
-            converted[name] = str(src_path)
             continue
         mov_path = convert_to_mov(src_path, out_dir)
         converted[name] = str(mov_path)
@@ -267,15 +269,45 @@ def ffprobe_fps(path) -> Fraction:
     return ffprobe_info(path)["fps"]
 
 
+def _parse_tc_to_seconds(tc_str: str, fps: Fraction) -> float:
+    """Converte string de timecode (HH:MM:SS:FF ou HH:MM:SS;FF para drop-frame)
+    em segundos reais. O separador ';' indica drop-frame."""
+    if not tc_str:
+        return 0.0
+    try:
+        drop = ";" in tc_str
+        tc_str = tc_str.replace(";", ":")
+        parts = tc_str.split(":")
+        if len(parts) != 4:
+            return 0.0
+        h, m, s, f = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        fps_round = round(fps.numerator / fps.denominator)
+        if drop and fps_round in (30, 60):
+            # Drop-frame: conta frames totais corrigindo os frames dropados
+            drop_per_min = 2 if fps_round == 30 else 4
+            total_min = h * 60 + m
+            total_frames = (
+                fps_round * 3600 * h
+                + fps_round * 60 * m
+                + fps_round * s
+                + f
+                - drop_per_min * (total_min - total_min // 10)
+            )
+        else:
+            total_frames = ((h * 3600 + m * 60 + s) * fps_round) + f
+        return total_frames * fps.denominator / fps.numerator
+    except Exception:
+        return 0.0
+
+
 def ffprobe_info(path) -> dict:
-    """Retorna fps, width, height, duration, start_time e audio_channels do arquivo."""
+    """Retorna fps, width, height, duration, start_time, tc_start e audio_channels."""
     try:
         out = subprocess.check_output(
             [
                 "ffprobe", "-v", "0",
-                "-show_entries",
-                "stream=r_frame_rate,width,height,channels,codec_type"
-                ":format=duration,start_time",
+                "-show_streams",
+                "-show_format",
                 "-of", "json", str(path),
             ],
             stderr=subprocess.DEVNULL,
@@ -284,12 +316,13 @@ def ffprobe_info(path) -> dict:
     except Exception:
         return {
             "fps": Fraction(30, 1), "width": 1920, "height": 1080,
-            "duration": 0.0, "start_time": 0.0, "audio_channels": 2,
+            "duration": 0.0, "start_time": 0.0, "tc_start": 0.0, "audio_channels": 2,
         }
 
     fps = Fraction(30, 1)
     width, height = 1920, 1080
     audio_channels = 2
+    tc_str = ""
 
     for s in data.get("streams", []):
         if s.get("codec_type") == "video" and "r_frame_rate" in s:
@@ -300,8 +333,13 @@ def ffprobe_info(path) -> dict:
                 pass
             width = s.get("width", width)
             height = s.get("height", height)
+            if not tc_str:
+                tc_str = s.get("tags", {}).get("timecode", "")
         elif s.get("codec_type") == "audio":
             audio_channels = s.get("channels", audio_channels)
+        # Pega TC do stream de dados (tmcd) se ainda não temos
+        if not tc_str:
+            tc_str = s.get("tags", {}).get("timecode", "")
 
     fmt = data.get("format", {})
     try:
@@ -313,10 +351,12 @@ def ffprobe_info(path) -> dict:
     except Exception:
         start_time = 0.0
 
+    tc_start = _parse_tc_to_seconds(tc_str, fps) if tc_str else start_time
+
     return {
         "fps": fps, "width": width, "height": height,
         "duration": duration, "start_time": start_time,
-        "audio_channels": audio_channels,
+        "tc_start": tc_start, "audio_channels": audio_channels,
     }
 
 
@@ -442,9 +482,13 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
         abs_path = os.path.abspath(path)
         audio_channels = info.get("audio_channels", 2)
         dur_str = secs_to_rational(info.get("duration", 0.0), afps)
-        start_str_asset = secs_to_rational(info.get("start_time", 0.0), afps)
+        # tc_start = timecode embutido no arquivo (lido via ffprobe).
+        # O Resolve usa o TC do arquivo para linkar assets; <asset start> deve
+        # bater com esse valor ou o Resolve não reconhece o arquivo.
+        tc_start = info.get("tc_start", info.get("start_time", 0.0))
+        start_str_asset = secs_to_rational(tc_start, afps)
         asset_id = f"r{next_id}"; next_id += 1
-        clip_asset_ids.append(asset_id)
+        clip_asset_ids.append((asset_id, tc_start))
         resources.append(
             f'        <asset audioSources="1" format="{fmt_id}" audioChannels="{audio_channels}" '
             f'duration="{dur_str}" hasAudio="1" hasVideo="1" id="{asset_id}" name="{escape(filename)}" start="{start_str_asset}">\n'
@@ -476,12 +520,15 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
         src = r["source"]
         start, end = float(r["start"]), float(r["end"])
         dur = end - start
-        asset_id = clip_asset_ids[i]  # cada clip tem seu próprio asset ID único
+        asset_id, tc_start = clip_asset_ids[i]
         afps = fps_by_source[src]
 
         offset_str = secs_to_rational(total_offset, afps)
         duration_str = secs_to_rational(dur, afps)
-        start_str = secs_to_rational(start, afps)
+        # <asset-clip start> = posição absoluta no TC do arquivo fonte.
+        # Se o arquivo tem TC embutido (tc_start > 0), o in-point é
+        # tc_start + offset_na_fonte (igual ao padrão do próprio Resolve).
+        start_str = secs_to_rational(tc_start + start, afps)
         one_frame_str = secs_to_rational(afps.denominator / afps.numerator, afps)
         filename = Path(sources[src]).name
         clip_name = filename
