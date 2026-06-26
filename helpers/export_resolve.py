@@ -368,71 +368,103 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
     overlays = edl.get("overlays") or []
 
     fps_by_source = {name: (fps_override or ffprobe_fps(path)) for name, path in sources.items()}
-    seq_fps = next(iter(fps_by_source.values())) if fps_by_source else Fraction(30, 1)
 
     # Cache de info ffprobe por source (evita chamar N vezes o mesmo arquivo)
     source_info_cache = {name: ffprobe_info(path) for name, path in sources.items()}
 
-    # ---- resources: 1 asset por CLIP (padrão que o DaVinci Resolve espera ao
-    # importar FCPXML — ele próprio exporta um <asset> único por ocorrência na
-    # timeline, mesmo que vários apontem para o mesmo arquivo fonte) ----
+    # Pre-computa paths/fps/info dos overlays (precisamos para montar os formats)
+    overlay_infos = []
+    for ov in overlays:
+        ov_path = os.path.abspath(str((edit_dir / ov["file"]) if not Path(ov["file"]).is_absolute() else ov["file"]))
+        ov_fps = ffprobe_fps(ov_path)
+        ov_info = ffprobe_info(ov_path)
+        overlay_infos.append((ov_path, ov_fps, ov_info))
+
+    def _fmt_name(w, h, afps):
+        fps_code = str(round(afps.numerator / afps.denominator * 100)) if afps.denominator != 1 else str(afps.numerator)
+        dim = str(h) if w == 1920 else f"{w}x{h}"
+        return f"FFVideoFormat{dim}p{fps_code}"
+
+    # ---- resources: formats compartilhados por (w, h, fps), igual ao Resolve ----
+    # Um <format> único por resolução+fps; todos os assets daquela especificação
+    # referenciam o mesmo id — exatamente como o Resolve próprio exporta.
     resources = []
     next_id = 1
+    shared_formats = {}  # (w, h, afps) -> format_id
 
-    # Formato da sequência (usa fps do primeiro source)
-    if sources:
-        first_name = next(iter(sources))
-        first_fps = fps_by_source[first_name]
-        first_info = source_info_cache[first_name]
-        seq_fdur = f"{first_fps.denominator}/{first_fps.numerator}s"
-        resources.append(
-            f'    <format id="r_fmt_seq" width="{first_info.get("width", 1920)}" '
-            f'height="{first_info.get("height", 1080)}" frameDuration="{seq_fdur}" />\n'
-        )
-
-    # Um asset por range/clip
-    clip_asset_ids = []
     for r in ranges:
         src = r["source"]
         if src not in sources:
             raise ValueError(f"Range referencia source desconhecido '{src}'")
+        info = source_info_cache[src]
+        afps = fps_by_source[src]
+        key = (info.get("width", 1920), info.get("height", 1080), afps)
+        if key not in shared_formats:
+            shared_formats[key] = f"r{next_id}"; next_id += 1
+
+    for ov_path, ov_fps, ov_info in overlay_infos:
+        key = (ov_info.get("width", 1920), ov_info.get("height", 1080), ov_fps)
+        if key not in shared_formats:
+            shared_formats[key] = f"r{next_id}"; next_id += 1
+
+    for (w, h, afps), fmt_id in shared_formats.items():
+        fdur = f"{afps.denominator}/{afps.numerator}s"
+        fmt_name = _fmt_name(w, h, afps)
+        resources.append(
+            f'        <format width="{w}" height="{h}" frameDuration="{fdur}" id="{fmt_id}" name="{fmt_name}"/>\n'
+        )
+
+    # Formato da sequência = formato do primeiro source/range
+    if ranges:
+        _fs = ranges[0]["source"]
+        _fi = source_info_cache[_fs]
+        _fa = fps_by_source[_fs]
+        seq_fmt_id = shared_formats[(_fi.get("width", 1920), _fi.get("height", 1080), _fa)]
+        seq_fps = _fa
+    elif shared_formats:
+        seq_fmt_id = next(iter(shared_formats.values()))
+        seq_fps = next(iter(fps_by_source.values())) if fps_by_source else Fraction(30, 1)
+    else:
+        seq_fmt_id = "r0"
+        seq_fps = Fraction(30, 1)
+
+    # Um asset por range/clip — name = filename real do arquivo no disco
+    clip_asset_ids = []
+    for r in ranges:
+        src = r["source"]
         path = sources[src]
         afps = fps_by_source[src]
         info = source_info_cache[src]
-        fdur = f"{afps.denominator}/{afps.numerator}s"
+        w = info.get("width", 1920)
+        h = info.get("height", 1080)
+        fmt_id = shared_formats[(w, h, afps)]
+        filename = Path(path).name
         abs_path = os.path.abspath(path)
         audio_channels = info.get("audio_channels", 2)
-        width = info.get("width", 1920)
-        height = info.get("height", 1080)
         dur_str = secs_to_rational(info.get("duration", 0.0), afps)
         start_str_asset = secs_to_rational(info.get("start_time", 0.0), afps)
         asset_id = f"r{next_id}"; next_id += 1
         clip_asset_ids.append(asset_id)
         resources.append(
-            f'    <format id="r_fmt_{asset_id}" width="{width}" height="{height}" frameDuration="{fdur}" />\n'
-            f'    <asset id="{asset_id}" name="{escape(src)}" '
-            f'hasVideo="1" hasAudio="1" audioSources="1" audioChannels="{audio_channels}" '
-            f'format="r_fmt_{asset_id}" duration="{dur_str}" start="{start_str_asset}">\n'
-            f'        <media-rep src="file://{escape(abs_path)}" kind="original-media"/>\n'
-            f'    </asset>\n'
+            f'        <asset audioSources="1" format="{fmt_id}" audioChannels="{audio_channels}" '
+            f'duration="{dur_str}" hasAudio="1" hasVideo="1" id="{asset_id}" name="{escape(filename)}" start="{start_str_asset}">\n'
+            f'            <media-rep src="file://{escape(abs_path)}" kind="original-media"/>\n'
+            f'        </asset>\n'
         )
 
     overlay_asset_ids = []
-    for ov in overlays:
+    for (ov_path, ov_fps, ov_info), ov in zip(overlay_infos, overlays):
         asset_id = f"r{next_id}"; next_id += 1
         overlay_asset_ids.append(asset_id)
-        ov_path = os.path.abspath(str((edit_dir / ov["file"]) if not Path(ov["file"]).is_absolute() else ov["file"]))
-        ov_fps = ffprobe_fps(ov_path)
-        fdur = f"{ov_fps.denominator}/{ov_fps.numerator}s"
-        ov_info = ffprobe_info(ov_path)
+        w = ov_info.get("width", 1920)
+        h = ov_info.get("height", 1080)
+        fmt_id = shared_formats[(w, h, ov_fps)]
         ov_dur_str = secs_to_rational(ov_info.get("duration", 0.0), ov_fps)
         resources.append(
-            f'    <format id="r_fmt_{asset_id}" width="{ov_info.get("width", 1920)}" height="{ov_info.get("height", 1080)}" frameDuration="{fdur}" />\n'
-            f'    <asset id="{asset_id}" name="{escape(Path(ov["file"]).name)}" '
-            f'hasVideo="1" hasAudio="0" '
-            f'format="r_fmt_{asset_id}" duration="{ov_dur_str}" start="0/1s">\n'
-            f'        <media-rep src="file://{escape(ov_path)}" kind="original-media"/>\n'
-            f'    </asset>\n'
+            f'        <asset audioSources="1" format="{fmt_id}" audioChannels="0" '
+            f'duration="{ov_dur_str}" hasAudio="0" hasVideo="1" id="{asset_id}" name="{escape(Path(ov["file"]).name)}" start="0/1s">\n'
+            f'            <media-rep src="file://{escape(ov_path)}" kind="original-media"/>\n'
+            f'        </asset>\n'
         )
 
     # ---- clipes principais (cortes), em ordem = decupagem ----
@@ -451,7 +483,8 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
         duration_str = secs_to_rational(dur, afps)
         start_str = secs_to_rational(start, afps)
         one_frame_str = secs_to_rational(afps.denominator / afps.numerator, afps)
-        clip_name = f"{src} ({r.get('beat', '')})".strip()
+        filename = Path(sources[src]).name
+        clip_name = filename
 
         note_parts = []
         if r.get("beat"):
@@ -494,10 +527,12 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
                 f'value="{escape(r["beat"])}" note="{escape(note)}"/>\n'
             )
 
+        info = source_info_cache[src]
+        fmt_id = shared_formats[(info.get("width", 1920), info.get("height", 1080), afps)]
         clips.append(
-            f'        <asset-clip name="{escape(clip_name)}" ref="{asset_id}" '
-            f'offset="{offset_str}" duration="{duration_str}" start="{start_str}" '
-            f'format="r_fmt_{asset_id}" tcFormat="NDF">\n'
+            f'        <asset-clip tcFormat="NDF" offset="{offset_str}" enabled="1" '
+            f'format="{fmt_id}" duration="{duration_str}" ref="{asset_id}" '
+            f'name="{escape(clip_name)}" start="{start_str}">\n'
             f'{marker_xml}'
             f'{grade_filter_xml}'
             f'        </asset-clip>\n'
@@ -506,33 +541,33 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
 
     # ---- overlays numa segunda trilha (lane="1"), por cima do corte principal ----
     overlay_clips = []
-    for ov, asset_id in zip(overlays, overlay_asset_ids):
+    for (ov_path, ov_fps, ov_info), ov, asset_id in zip(overlay_infos, overlays, overlay_asset_ids):
         ov_offset = float(ov["start_in_output"])
         ov_dur = float(ov["duration"])
+        ov_fmt_id = shared_formats[(ov_info.get("width", 1920), ov_info.get("height", 1080), ov_fps)]
         overlay_clips.append(
-            f'        <asset-clip name="{escape(Path(ov["file"]).name)}" ref="{asset_id}" '
-            f'lane="1" offset="{secs_to_rational(ov_offset, seq_fps)}" '
-            f'duration="{secs_to_rational(ov_dur, seq_fps)}" '
-            f'format="r_fmt_{asset_id}" tcFormat="NDF"/>\n'
+            f'        <asset-clip tcFormat="NDF" offset="{secs_to_rational(ov_offset, seq_fps)}" enabled="1" '
+            f'format="{ov_fmt_id}" duration="{secs_to_rational(ov_dur, seq_fps)}" ref="{asset_id}" '
+            f'name="{escape(Path(ov["file"]).name)}" lane="1" start="0s"/>\n'
         )
 
     total_duration_str = secs_to_rational(total_offset, seq_fps if not ranges else fps_by_source[ranges[-1]["source"]])
 
     fcpxml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE fcpxml>
-<fcpxml version="1.10">
-  <resources>
-{''.join(resources)}  </resources>
-  <library>
-    <event name="video-use export">
-      <project name="video-use timeline">
-        <sequence format="r_fmt_seq" duration="{total_duration_str}" tcStart="0s" tcFormat="NDF">
-          <spine>
-{''.join(clips)}{''.join(overlay_clips)}          </spine>
-        </sequence>
-      </project>
-    </event>
-  </library>
+<fcpxml version="1.9">
+    <resources>
+{''.join(resources)}    </resources>
+    <library>
+        <event name="video-use export">
+            <project name="video-use timeline">
+                <sequence tcFormat="NDF" format="{seq_fmt_id}" duration="{total_duration_str}" tcStart="0s">
+                    <spine>
+{''.join(clips)}{''.join(overlay_clips)}                    </spine>
+                </sequence>
+            </project>
+        </event>
+    </library>
 </fcpxml>
 '''
     return fcpxml
