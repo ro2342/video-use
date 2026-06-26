@@ -370,31 +370,52 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
     fps_by_source = {name: (fps_override or ffprobe_fps(path)) for name, path in sources.items()}
     seq_fps = next(iter(fps_by_source.values())) if fps_by_source else Fraction(30, 1)
 
-    # ---- resources: 1 asset por source + 1 asset por overlay ----
+    # Cache de info ffprobe por source (evita chamar N vezes o mesmo arquivo)
+    source_info_cache = {name: ffprobe_info(path) for name, path in sources.items()}
+
+    # ---- resources: 1 asset por CLIP (padrão que o DaVinci Resolve espera ao
+    # importar FCPXML — ele próprio exporta um <asset> único por ocorrência na
+    # timeline, mesmo que vários apontem para o mesmo arquivo fonte) ----
     resources = []
-    asset_id_by_source = {}
     next_id = 1
 
-    for name, path in sources.items():
-        asset_id = f"r{next_id}"; next_id += 1
-        asset_id_by_source[name] = asset_id
-        afps = fps_by_source[name]
+    # Formato da sequência (usa fps do primeiro source)
+    if sources:
+        first_name = next(iter(sources))
+        first_fps = fps_by_source[first_name]
+        first_info = source_info_cache[first_name]
+        seq_fdur = f"{first_fps.denominator}/{first_fps.numerator}s"
+        resources.append(
+            f'    <format id="r_fmt_seq" width="{first_info.get("width", 1920)}" '
+            f'height="{first_info.get("height", 1080)}" frameDuration="{seq_fdur}" />\n'
+        )
+
+    # Um asset por range/clip
+    clip_asset_ids = []
+    for r in ranges:
+        src = r["source"]
+        if src not in sources:
+            raise ValueError(f"Range referencia source desconhecido '{src}'")
+        path = sources[src]
+        afps = fps_by_source[src]
+        info = source_info_cache[src]
         fdur = f"{afps.denominator}/{afps.numerator}s"
         abs_path = os.path.abspath(path)
-        info = ffprobe_info(path)
         audio_channels = info.get("audio_channels", 2)
+        width = info.get("width", 1920)
+        height = info.get("height", 1080)
         dur_str = secs_to_rational(info.get("duration", 0.0), afps)
         start_str_asset = secs_to_rational(info.get("start_time", 0.0), afps)
+        asset_id = f"r{next_id}"; next_id += 1
+        clip_asset_ids.append(asset_id)
         resources.append(
-            f'    <format id="r_fmt_{asset_id}" frameDuration="{fdur}" />\n'
-            f'    <asset id="{asset_id}" name="{escape(name)}" '
+            f'    <format id="r_fmt_{asset_id}" width="{width}" height="{height}" frameDuration="{fdur}" />\n'
+            f'    <asset id="{asset_id}" name="{escape(src)}" '
             f'hasVideo="1" hasAudio="1" audioSources="1" audioChannels="{audio_channels}" '
             f'format="r_fmt_{asset_id}" duration="{dur_str}" start="{start_str_asset}">\n'
             f'        <media-rep src="file://{escape(abs_path)}" kind="original-media"/>\n'
             f'    </asset>\n'
         )
-        if next_id == 2:  # primeiro source = formato da sequência
-            resources.append(f'    <format id="r_fmt_seq" frameDuration="{fdur}" />\n')
 
     overlay_asset_ids = []
     for ov in overlays:
@@ -406,7 +427,7 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
         ov_info = ffprobe_info(ov_path)
         ov_dur_str = secs_to_rational(ov_info.get("duration", 0.0), ov_fps)
         resources.append(
-            f'    <format id="r_fmt_{asset_id}" frameDuration="{fdur}" />\n'
+            f'    <format id="r_fmt_{asset_id}" width="{ov_info.get("width", 1920)}" height="{ov_info.get("height", 1080)}" frameDuration="{fdur}" />\n'
             f'    <asset id="{asset_id}" name="{escape(Path(ov["file"]).name)}" '
             f'hasVideo="1" hasAudio="0" '
             f'format="r_fmt_{asset_id}" duration="{ov_dur_str}" start="0/1s">\n'
@@ -423,13 +444,13 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
         src = r["source"]
         start, end = float(r["start"]), float(r["end"])
         dur = end - start
-        asset_id = asset_id_by_source.get(src)
-        if asset_id is None:
-            raise ValueError(f"Range referencia source desconhecido '{src}'")
+        asset_id = clip_asset_ids[i]  # cada clip tem seu próprio asset ID único
+        afps = fps_by_source[src]
 
-        offset_str = secs_to_rational(total_offset, seq_fps)
-        duration_str = secs_to_rational(dur, seq_fps)
-        start_str = secs_to_rational(start, seq_fps)
+        offset_str = secs_to_rational(total_offset, afps)
+        duration_str = secs_to_rational(dur, afps)
+        start_str = secs_to_rational(start, afps)
+        one_frame_str = secs_to_rational(afps.denominator / afps.numerator, afps)
         clip_name = f"{src} ({r.get('beat', '')})".strip()
 
         note_parts = []
@@ -465,11 +486,11 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
             except Exception as e:
                 note_parts.append(f"[grade export falhou: {e}]")
 
-        # marker do beat, posicionado no início do clipe
+        # marker do beat — start="0s" é relativo ao início do asset-clip
         marker_xml = ""
         if r.get("beat"):
             marker_xml = (
-                f'          <marker start="{offset_str}" duration="{secs_to_rational(1/seq_fps.numerator*seq_fps.denominator, seq_fps)}" '
+                f'          <marker start="0s" duration="{one_frame_str}" '
                 f'value="{escape(r["beat"])}" note="{escape(note)}"/>\n'
             )
 
@@ -495,7 +516,7 @@ def build_fcpxml(edl: dict, edit_dir: Path, fps_override=None, compute_auto_grad
             f'format="r_fmt_{asset_id}" tcFormat="NDF"/>\n'
         )
 
-    total_duration_str = secs_to_rational(total_offset, seq_fps)
+    total_duration_str = secs_to_rational(total_offset, seq_fps if not ranges else fps_by_source[ranges[-1]["source"]])
 
     fcpxml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE fcpxml>
